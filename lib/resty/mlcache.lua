@@ -275,6 +275,10 @@ function _M.new(name, shm, opts)
         if opts.shm_locks ~= nil and type(opts.shm_locks) ~= "string" then
             error("opts.shm_locks must be a string", 2)
         end
+
+        if opts.shm_expire ~= nil and type(opts.shm_expire) ~= "string" then
+            error("opts.shm_expire must be a string", 2)
+        end
     else
         opts = {}
     end
@@ -301,6 +305,15 @@ function _M.new(name, shm, opts)
         end
     end
 
+    local dict_expire
+    if opts.shm_expire then
+        dict_expire = shared[opts.shm_expire]
+        if not dict_expire then
+            return nil, "no such lua_shared_dict for opts.shm_expire: "
+                    .. opts.shm_expire
+        end
+    end
+
     local self          = {
         name            = name,
         dict            = dict,
@@ -308,6 +321,8 @@ function _M.new(name, shm, opts)
         dict_miss       = dict_miss,
         shm_miss        = opts.shm_miss,
         shm_locks       = opts.shm_locks or shm,
+        shm_expire      = opts.shm_expire,
+        dict_expire     = dict_expire,
         ttl             = opts.ttl     or 30,
         neg_ttl         = opts.neg_ttl or 5,
         resurrect_ttl   = opts.resurrect_ttl,
@@ -479,14 +494,30 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
     -- try again to try to trigger more LRU evictions.
 
     local tries = 0
+    local expire_tries = 0
     local ok, err
-
+    local expire_ok, expire_err
     while tries < shm_set_tries do
         tries = tries + 1
 
         ok, err = dict:set(shm_key, shm_value, ttl, flags or 0)
         if ok or err and err ~= "no memory" then
             break
+        end
+        if self.dict_expire then
+            expire_ok, expire_err = self.dict_expire:set(shm_key, shm_value, 0, flags or 0)
+        end
+
+    end
+
+    if self.dict_expire then
+        while expire_tries < shm_set_tries do
+            expire_tries = expire_tries + 1
+
+            expire_ok, expire_err = self.dict_expire:set(shm_key, shm_value, 0, flags or 0)
+            if expire_ok or expire_err and expire_err ~= "no memory" then
+                break
+            end
         end
     end
 
@@ -500,6 +531,20 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
                       shm, "' after ", tries, " tries (no memory), ",
                       "it is either fragmented or cannot allocate more ",
                       "memory, consider increasing 'opts.shm_set_tries'")
+    end
+
+    if self.dict_expire then
+        if not expire_ok then
+            if expire_err ~= "no memory" then
+                ngx_log(WARN, "could not write to lua_shared_dict '" .. self.shm_expire
+                        .. "': " .. expire_err)
+            end
+
+            ngx_log(WARN, "could not write to lua_shared_dict '",
+                self.shm_expire, "' after ", tries, " tries (no memory), ",
+                "it is either fragmented or cannot allocate more ",
+                "memory, consider increasing 'opts.shm_set_tries'")
+        end
     end
 
     return true
@@ -535,6 +580,17 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
             -- also check v == nil
             return nil, "could not read from lua_shared_dict: " .. shmerr
         end
+    end
+
+    if self.shm_expire and v == nil then
+        -- if we cache expire in another shm, maybe it is there
+        v, shmerr = self.dict_expire:get(shm_key)
+        if v == nil and shmerr then
+            -- shmerr can be 'flags' upon successful get() calls, so we
+            -- also check v == nil
+            return nil, "could not read from lua_shared_dict: " .. shmerr
+        end
+        went_stale = true
     end
 
     if v ~= nil then
