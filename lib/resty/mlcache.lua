@@ -4,6 +4,7 @@ local cjson      = require "cjson.safe"
 local new_tab    = require "table.new"
 local lrucache   = require "resty.lrucache"
 local resty_lock = require "resty.lock"
+local redis = require "resty.redis"
 local tablepool
 do
     local pok
@@ -135,6 +136,53 @@ local unmarshallers = {
         return t
     end,
 }
+
+local function close_redis(rediz)
+    if not rediz then
+        return
+    end
+    local ok, err = rediz:set_keepalive(self.redis_max_rest_time, self.redis_keepalive_size)
+    if not ok then
+        ngx_log(WARN, "failed to set Redis keepalive: ", err)
+    end
+
+end
+
+local function new_redis(conf)
+    local rediz = redis:new()
+    rediz:set_timeout(conf.timeout)
+    local ok, err = rediz:connect(conf.host, conf.port)
+    if not ok then 
+        ngx_log(WARN, "failed to connect to Redis: ", err)
+        return nil, err
+    end
+
+    local count
+    count, err = rediz:get_reused_times()
+
+    if 0 == count and conf.password and conf.password ~= "" then
+        local ok, err = rediz:auth(conf.password)
+        if not ok then
+            ngx_log(WARN, "failed to connect to Redis: ", err)
+            return nil, err
+        end
+    elseif err then
+        ngx_log(WARN, "failed to get reused times: ", err)
+        return nil, err
+    end
+
+    if conf.database ~= nil and conf.database > 0 then
+        local ok, err = rediz:select(conf.database)
+        if not ok then 
+            ngx_log("failed to change Redis database: ", err)
+            return nil, err
+        end
+    end
+
+    return rediz
+end
+
+
 
 
 local function rebuild_lru(self)
@@ -276,9 +324,39 @@ function _M.new(name, shm, opts)
             error("opts.shm_locks must be a string", 2)
         end
 
-        if opts.shm_expire ~= nil and type(opts.shm_expire) ~= "string" then
-            error("opts.shm_expire must be a string", 2)
+        local redis_keepalive_size, redis_max_rest_time
+        if opts.redis_config ~= nil and type(opts.redis_config) ~= "table" then
+            if type(opts.redis_config) ~= "table" then
+                error("opts.redis_config must be a table", 2)
+            end
+            if type(opts.redis_config.host) ~= "string" then
+                error("opts.redis_config.host must be a string", 2)
+            end
+            if type(opts.redis_config.port) ~= "string" then
+                error("opts.redis_config.port must be a string", 2)
+            end
+            if type(opts.redis_config.password) ~= "string" then
+                error("opts.redis_config.password must be a string", 2)
+            end
+            if opts.redis_config.timeout == nil then
+                opts.redis_config.timeout = 100
+            end
+            if type(opts.redis_config.timeout) ~= "number" then
+                error("opts.redis_config.timeout must be a number", 2)
+            end
+            if opts.redis_config.redis_keepalive_size ~= nil and type(opts.redis_config.redis_keepalive_size) ~= "number" then
+                error("opts.redis_config.redis_keepalive_size must be a number", 2)
+            end
+            redis_keepalive_size = opts.redis_config.redis_keepalive_size
+            if opts.redis_config.redis_max_rest_time and type(opts.redis_config.redis_max_rest_time) ~= "number" then
+                error("opts.redis_config.redis_max_rest_time must be a number", 2)
+            end
+            redis_max_rest_time = opts.redis_config.redis_max_rest_time
+            if opts.redis_config.database ~= nil and type(opts.redis_config.database) ~= "number" then
+                error("opts.redis_config.timeout must be a number", 2)
+            end
         end
+
     else
         opts = {}
     end
@@ -305,32 +383,24 @@ function _M.new(name, shm, opts)
         end
     end
 
-    local dict_expire
-    if opts.shm_expire then
-        dict_expire = shared[opts.shm_expire]
-        if not dict_expire then
-            return nil, "no such lua_shared_dict for opts.shm_expire: "
-                    .. opts.shm_expire
-        end
-    end
-
     local self          = {
-        name            = name,
-        dict            = dict,
-        shm             = shm,
-        dict_miss       = dict_miss,
-        shm_miss        = opts.shm_miss,
-        shm_locks       = opts.shm_locks or shm,
-        shm_expire      = opts.shm_expire,
-        dict_expire     = dict_expire,
-        ttl             = opts.ttl     or 30,
-        neg_ttl         = opts.neg_ttl or 5,
-        resurrect_ttl   = opts.resurrect_ttl,
-        lru_size        = opts.lru_size or 100,
-        resty_lock_opts = opts.resty_lock_opts,
-        l1_serializer   = opts.l1_serializer,
-        shm_set_tries   = opts.shm_set_tries or SHM_SET_DEFAULT_TRIES,
-        debug           = opts.debug,
+        name                 = name,
+        dict                 = dict,
+        shm                  = shm,
+        dict_miss            = dict_miss,
+        shm_miss             = opts.shm_miss,
+        shm_locks            = opts.shm_locks or shm,
+        redis_config         = opts.redis_config,
+        redis_keepalive_size = redis_keepalive_size or 200,
+        redis_max_rest_time  = redis_max_rest_time  or 10000
+        ttl                  = opts.ttl     or 30,
+        neg_ttl              = opts.neg_ttl or 5,
+        resurrect_ttl        = opts.resurrect_ttl,
+        lru_size             = opts.lru_size or 100,
+        resty_lock_opts      = opts.resty_lock_opts,
+        l1_serializer        = opts.l1_serializer,
+        shm_set_tries        = opts.shm_set_tries or SHM_SET_DEFAULT_TRIES,
+        debug                = opts.debug,
     }
 
     if opts.ipc_shm or opts.ipc then
@@ -494,7 +564,6 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
     -- try again to try to trigger more LRU evictions.
 
     local tries = 0
-    local expire_tries = 0
     local ok, err
     local expire_ok, expire_err
     while tries < shm_set_tries do
@@ -504,20 +573,16 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
         if ok or err and err ~= "no memory" then
             break
         end
-        if self.dict_expire then
-            expire_ok, expire_err = self.dict_expire:set(shm_key, shm_value, 0, flags or 0)
-        end
-
     end
 
-    if self.dict_expire then
-        while expire_tries < shm_set_tries do
-            expire_tries = expire_tries + 1
-
-            expire_ok, expire_err = self.dict_expire:set(shm_key, shm_value, 0, flags or 0)
-            if expire_ok or expire_err and expire_err ~= "no memory" then
-                break
+    if self.redis_config then
+        local redis, err = new_redis(self.redis_config)
+        if redis and not err then
+            expire_ok, expire_err = redis:set(shm_key, shm_value)
+            if not expire_ok then
+                ngx_log(WARN, "could not write to redis: ", expire_err)
             end
+            close_redis(redis)
         end
     end
 
@@ -531,20 +596,6 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
                       shm, "' after ", tries, " tries (no memory), ",
                       "it is either fragmented or cannot allocate more ",
                       "memory, consider increasing 'opts.shm_set_tries'")
-    end
-
-    if self.dict_expire then
-        if not expire_ok then
-            if expire_err ~= "no memory" then
-                ngx_log(WARN, "could not write to lua_shared_dict '" .. self.shm_expire
-                        .. "': " .. expire_err)
-            end
-
-            ngx_log(WARN, "could not write to lua_shared_dict '",
-                self.shm_expire, "' after ", tries, " tries (no memory), ",
-                "it is either fragmented or cannot allocate more ",
-                "memory, consider increasing 'opts.shm_set_tries'")
-        end
     end
 
     return true
@@ -582,15 +633,19 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
         end
     end
 
-    if self.shm_expire and v == nil then
+    if self.redis_config and v == nil then
         -- if we cache expire in another shm, maybe it is there
-        v, shmerr = self.dict_expire:get(shm_key)
-        if v == nil and shmerr then
-            -- shmerr can be 'flags' upon successful get() calls, so we
-            -- also check v == nil
-            return nil, "could not read from lua_shared_dict: " .. shmerr
+        local redis, err = new_redis(self.redis_config)
+        if redis then
+            v, shmerr = redis:get(shm_key)
+            close_redis(redis)
+            if v == nil or v == ngx.null then
+                -- shmerr can be 'flags' upon successful get() calls, so we
+                -- also check v == nil
+                return nil, "could not read from redis"
+            end
+            went_stale = true
         end
-        went_stale = true
     end
 
     if v ~= nil then
