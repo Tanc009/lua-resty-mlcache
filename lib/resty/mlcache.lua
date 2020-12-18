@@ -137,7 +137,7 @@ local unmarshallers = {
     end,
 }
 
-local function close_redis(rediz)
+local function close_redis(self, rediz)
     if not rediz then
         return
     end
@@ -332,8 +332,8 @@ function _M.new(name, shm, opts)
             if type(opts.redis_config.host) ~= "string" then
                 error("opts.redis_config.host must be a string", 2)
             end
-            if type(opts.redis_config.port) ~= "string" then
-                error("opts.redis_config.port must be a string", 2)
+            if type(opts.redis_config.port) ~= "number" then
+                error("opts.redis_config.port must be a number", 2)
             end
             if type(opts.redis_config.password) ~= "string" then
                 error("opts.redis_config.password must be a string", 2)
@@ -579,10 +579,11 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
         local redis, err = new_redis(self.redis_config)
         if redis and not err then
             expire_ok, expire_err = redis:set(shm_key, shm_value)
+            ngx_log(ngx.DEBUG,"write to redis: ", shm_key, " = ", tostring(shm_value))
             if not expire_ok then
                 ngx_log(WARN, "could not write to redis: ", expire_err)
             end
-            close_redis(redis)
+            close_redis(self, redis)
         end
     end
 
@@ -638,13 +639,13 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
         local redis, err = new_redis(self.redis_config)
         if redis then
             v, shmerr = redis:get(shm_key)
-            close_redis(redis)
-            if v == nil or v == ngx.null then
-                -- shmerr can be 'flags' upon successful get() calls, so we
-                -- also check v == nil
-                return nil, "could not read from redis"
+            ngx_log(ngx.DEBUG,"read redis: ", shm_key, " = ", tostring(v))
+            close_redis(self, redis)
+            if v ~= nil and v ~= ngx.null then
+                went_stale = true
+            else
+                v = nil
             end
-            went_stale = true
         end
     end
 
