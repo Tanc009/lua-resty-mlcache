@@ -392,7 +392,7 @@ function _M.new(name, shm, opts)
         shm_locks            = opts.shm_locks or shm,
         redis_config         = opts.redis_config,
         redis_keepalive_size = redis_keepalive_size or 200,
-        redis_max_rest_time  = redis_max_rest_time  or 10000
+        redis_max_rest_time  = redis_max_rest_time  or 10000,
         ttl                  = opts.ttl     or 30,
         neg_ttl              = opts.neg_ttl or 5,
         resurrect_ttl        = opts.resurrect_ttl,
